@@ -92,6 +92,9 @@ def aug_scale(X: torch.Tensor, lo: float = 0.9, hi: float = 1.1) -> torch.Tensor
 def aug_window_slice(X: torch.Tensor, min_ratio: float = 0.8) -> torch.Tensor:
     """Randomly crop a contiguous sub-window and resize back to original length.
     Same window for the whole batch (vectorised)."""
+    """50% probability of applying the augmentation"""
+    if random.random() > 0.5:
+        return X
     B, T, C = X.shape
     win_len = random.randint(int(T * min_ratio), T)
     start = random.randint(0, T - win_len)
@@ -106,6 +109,9 @@ def aug_time_warp(
 ) -> torch.Tensor:
     """Smooth non-linear time distortion via random cubic-spline-like warping.
     Each sample gets an independent warp (vectorised with grid_sample)."""
+    """50% probability of applying the augmentation"""
+    if random.random() > 0.5:
+        return X
     B, T, C = X.shape
     device = X.device
 
