@@ -23,6 +23,84 @@ from data_loader import NGAFIDDataset
 from model import CNNTransformerClassifier
 
 
+def print_dataset_info(dataset: NGAFIDDataset):
+    """Print dataset structure, label distribution, and the first sample."""
+    header = dataset.flight_header
+
+    print(f"\n{'=' * 60}")
+    print("  Dataset Structure Overview")
+    print(f"{'=' * 60}")
+
+    # flight_header schema
+    print("\n  [flight_header.csv]")
+    print(f"    Shape: {header.shape}  (rows × columns)")
+    print(f"    Columns & dtypes:")
+    for col in header.columns:
+        print(f"      {col:<25s}  {header[col].dtype}")
+    print(f"\n    First 3 rows:")
+    print(header.head(3).to_string(max_colwidth=30).replace("\n", "\n    "))
+
+    # fold distribution
+    fold_counts = header["fold"].value_counts().sort_index()
+    print(f"\n  [Fold distribution]")
+    for fold_id, cnt in fold_counts.items():
+        print(f"    Fold {fold_id}: {cnt} samples")
+
+    # label distribution
+    class_counts = header["target_class"].value_counts().sort_index()
+    print(f"\n  [target_class distribution]  ({dataset.num_classes} unique classes)")
+    print(f"    {'original_label':<16s} → {'mapped_idx':<10s}  count")
+    for orig_label, cnt in class_counts.items():
+        mapped = dataset._label2idx[orig_label]
+        print(f"    {str(orig_label):<16s} → {mapped:<10d}  {cnt}")
+
+    # normalization stats
+    print(f"\n  [Normalization stats]  (per-channel min / max, 23 channels)")
+    print(f"    mins : {dataset.mins[:5]} ... (showing first 5)")
+    print(f"    maxs : {dataset.maxs[:5]} ... (showing first 5)")
+
+    # first raw sample
+    first = dataset._data_dict[0]
+    raw_data = first["data"]
+    print(f"\n{'=' * 60}")
+    print("  First Sample (raw, before normalization)")
+    print(f"{'=' * 60}")
+    print(f"    target_class : {first['target_class']}")
+    print(f"    fold         : {first['fold']}")
+    print(f"    data shape   : {raw_data.shape}  (time_steps × channels)")
+    print(f"    data dtype   : {raw_data.dtype}")
+
+    nonzero_mask = np.any(raw_data != 0, axis=1)
+    actual_len = int(nonzero_mask.sum())
+    print(f"    actual length: {actual_len}  (non-zero rows out of {raw_data.shape[0]})")
+    print(f"    padding rows : {raw_data.shape[0] - actual_len}")
+
+    print(f"\n    data[0, :5]  (first timestep, first 5 channels):")
+    print(f"      {raw_data[0, :5]}")
+    first_nonzero = np.argmax(nonzero_mask) if actual_len > 0 else 0
+    print(f"    data[{first_nonzero}, :5]  (first non-zero row, first 5 channels):")
+    print(f"      {raw_data[first_nonzero, :5]}")
+    print(f"    data[-1, :5] (last timestep, first 5 channels):")
+    print(f"      {raw_data[-1, :5]}")
+
+    # first normalized sample
+    X_sample, y_sample = dataset.get_fold_data(first["fold"], training=False)
+    print(f"\n{'=' * 60}")
+    print("  First Sample (after min-max normalization)")
+    print(f"{'=' * 60}")
+    print(f"    X shape : {X_sample.shape}  (num_samples_in_fold × time_steps × channels)")
+    print(f"    X dtype : {X_sample.dtype}")
+    print(f"    y shape : {y_sample.shape}")
+    print(f"    y dtype : {y_sample.dtype}")
+    print(f"    y[0]    : {y_sample[0]}  (mapped label)")
+    print(f"    X[0] value range: [{X_sample[0].min():.4f}, {X_sample[0].max():.4f}]")
+    print(f"    X[0, 0, :5] (first timestep, first 5 channels):")
+    print(f"      {X_sample[0, 0, :5]}")
+    print(f"    X[0, -1, :5] (last timestep, first 5 channels):")
+    print(f"      {X_sample[0, -1, :5]}")
+    print()
+
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -213,6 +291,8 @@ def main():
     dataset = NGAFIDDataset(name=args.data_name, destination=args.data_dir)
     print(f"  Samples: {len(dataset.flight_header)}  |  Classes: {dataset.num_classes}")
     print(f"  Label mapping: {dataset.label_map}")
+
+    print_dataset_info(dataset)
 
     fold_results: list[float] = []
     t0 = time.time()
