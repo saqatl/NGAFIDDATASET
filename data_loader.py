@@ -8,14 +8,15 @@ requiring TensorFlow, so the environment only needs PyTorch.
 import os
 import tarfile
 
-import gdown
+import urllib.request
+
 import numpy as np
 import pandas as pd
 from compress_pickle import load
 from tqdm import tqdm
 
 NGAFID_URLS = {
-    "2days": "https://drive.google.com/uc?id=1-2pxwiQNhFnhTg7whosQoF_yztD5jOM2",
+    "2days": "https://zenodo.org/records/6624956/files/2days.tar.gz?download=1",
 }
 
 CHANNELS = 23
@@ -28,8 +29,9 @@ def _download_and_extract(name: str = "2days", destination: str = ""):
     data_dir = os.path.join(destination, name)
 
     if not os.path.exists(archive):
-        print(f"Downloading {name} dataset …")
-        gdown.download(url, archive, quiet=False)
+        print(f"Downloading {name} dataset from Zenodo …")
+        urllib.request.urlretrieve(url, archive)
+        print(f"Saved → {archive}")
 
     if not os.path.isdir(data_dir):
         print("Extracting …")

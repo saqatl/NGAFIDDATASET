@@ -1,7 +1,6 @@
 torch
 numpy
 pandas
-gdown
 compress_pickle
 lz4
 tqdm
