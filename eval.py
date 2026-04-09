@@ -15,7 +15,7 @@ import os
 
 import numpy as np
 import torch
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, f1_score, recall_score
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_loader import NGAFIDDataset
@@ -76,11 +76,15 @@ def evaluate_fold(fold, task, dataset, checkpoint_dir, batch_size, device):
     if bin_preds:
         bp, bl = np.concatenate(bin_preds), np.concatenate(bin_labels)
         result["binary_acc"] = float((bp == bl).mean())
+        result["binary_f1"] = float(f1_score(bl, bp, average="macro", zero_division=0))
+        result["binary_recall"] = float(recall_score(bl, bp, average="macro", zero_division=0))
         result["binary_preds"] = bp
         result["binary_labels"] = bl
     if multi_preds:
         mp, ml = np.concatenate(multi_preds), np.concatenate(multi_labels)
         result["multi_acc"] = float((mp == ml).mean())
+        result["multi_f1"] = float(f1_score(ml, mp, average="macro", zero_division=0))
+        result["multi_recall"] = float(recall_score(ml, mp, average="macro", zero_division=0))
         result["multi_preds"] = mp
         result["multi_labels"] = ml
 
@@ -113,6 +117,8 @@ def main():
         all_bin_p, all_bin_l = [], []
         all_mul_p, all_mul_l = [], []
         fold_accs_bin, fold_accs_mul = [], []
+        fold_f1_bin, fold_f1_mul = [], []
+        fold_recall_bin, fold_recall_mul = [], []
 
         for fold in folds:
             try:
@@ -124,23 +130,39 @@ def main():
 
             parts = [f"Fold {fold+1}:"]
             if "binary_acc" in res:
-                parts.append(f"Binary {res['binary_acc']:.4f}")
+                parts.append(f"Binary Acc={res['binary_acc']:.4f}")
+                parts.append(f"F1={res['binary_f1']:.4f}")
+                parts.append(f"Recall={res['binary_recall']:.4f}")
                 fold_accs_bin.append(res["binary_acc"])
+                fold_f1_bin.append(res["binary_f1"])
+                fold_recall_bin.append(res["binary_recall"])
                 all_bin_p.append(res["binary_preds"])
                 all_bin_l.append(res["binary_labels"])
             if "multi_acc" in res:
-                parts.append(f"Multiclass {res['multi_acc']:.4f}")
+                parts.append(f"Multi Acc={res['multi_acc']:.4f}")
+                parts.append(f"F1={res['multi_f1']:.4f}")
+                parts.append(f"Recall={res['multi_recall']:.4f}")
                 fold_accs_mul.append(res["multi_acc"])
+                fold_f1_mul.append(res["multi_f1"])
+                fold_recall_mul.append(res["multi_recall"])
                 all_mul_p.append(res["multi_preds"])
                 all_mul_l.append(res["multi_labels"])
             print("  " + "  ".join(parts))
 
         if fold_accs_bin:
             m, s = np.mean(fold_accs_bin), np.std(fold_accs_bin)
-            print(f"\n  Binary Acc mean: {m:.4f} ± {s:.4f}")
+            print(f"\n  Binary Acc mean:    {m:.4f} ± {s:.4f}")
+            m, s = np.mean(fold_f1_bin), np.std(fold_f1_bin)
+            print(f"  Binary F1 mean:     {m:.4f} ± {s:.4f}")
+            m, s = np.mean(fold_recall_bin), np.std(fold_recall_bin)
+            print(f"  Binary Recall mean: {m:.4f} ± {s:.4f}")
         if fold_accs_mul:
             m, s = np.mean(fold_accs_mul), np.std(fold_accs_mul)
-            print(f"  Multiclass Acc mean: {m:.4f} ± {s:.4f}")
+            print(f"\n  Multiclass Acc mean:    {m:.4f} ± {s:.4f}")
+            m, s = np.mean(fold_f1_mul), np.std(fold_f1_mul)
+            print(f"  Multiclass F1 mean:     {m:.4f} ± {s:.4f}")
+            m, s = np.mean(fold_recall_mul), np.std(fold_recall_mul)
+            print(f"  Multiclass Recall mean: {m:.4f} ± {s:.4f}")
 
         if all_bin_p:
             bp, bl = np.concatenate(all_bin_p), np.concatenate(all_bin_l)

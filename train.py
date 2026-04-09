@@ -40,6 +40,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import f1_score, recall_score
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_loader import NGAFIDDataset
@@ -208,7 +209,9 @@ def train_one_epoch(model, loader, task, criterions, optimizer, scheduler,
 @torch.no_grad()
 def evaluate(model, loader, task, criterions, device):
     model.eval()
-    loss_sum, bin_ok, multi_ok, n = 0.0, 0, 0, 0
+    loss_sum, n = 0.0, 0
+    bin_preds, bin_labels = [], []
+    multi_preds, multi_labels = [], []
 
     for X, y_bin, y_multi in loader:
         X, y_bin, y_multi = X.to(device), y_bin.to(device), y_multi.to(device)
@@ -216,25 +219,37 @@ def evaluate(model, loader, task, criterions, device):
         if task == "binary":
             logits = model(X)
             loss = criterions["binary"](logits, y_bin)
-            bin_ok += (logits.argmax(1) == y_bin).sum().item()
+            bin_preds.append(logits.argmax(1).cpu().numpy())
+            bin_labels.append(y_bin.cpu().numpy())
         elif task == "multiclass":
             logits = model(X)
             loss = criterions["multi"](logits, y_multi)
-            multi_ok += (logits.argmax(1) == y_multi).sum().item()
+            multi_preds.append(logits.argmax(1).cpu().numpy())
+            multi_labels.append(y_multi.cpu().numpy())
         else:
             bl, ml = model(X)
             loss = criterions["binary"](bl, y_bin) + criterions["multi"](ml, y_multi)
-            bin_ok += (bl.argmax(1) == y_bin).sum().item()
-            multi_ok += (ml.argmax(1) == y_multi).sum().item()
+            bin_preds.append(bl.argmax(1).cpu().numpy())
+            bin_labels.append(y_bin.cpu().numpy())
+            multi_preds.append(ml.argmax(1).cpu().numpy())
+            multi_labels.append(y_multi.cpu().numpy())
 
         loss_sum += loss.item() * X.size(0)
         n += X.size(0)
 
     r = {"loss": loss_sum / n}
-    if task in ("binary", "combined"):
-        r["binary_acc"] = bin_ok / n
-    if task in ("multiclass", "combined"):
-        r["multi_acc"] = multi_ok / n
+    if bin_preds:
+        bp = np.concatenate(bin_preds)
+        bl = np.concatenate(bin_labels)
+        r["binary_acc"] = float((bp == bl).mean())
+        r["binary_f1"] = float(f1_score(bl, bp, average="macro", zero_division=0))
+        r["binary_recall"] = float(recall_score(bl, bp, average="macro", zero_division=0))
+    if multi_preds:
+        mp = np.concatenate(multi_preds)
+        ml = np.concatenate(multi_labels)
+        r["multi_acc"] = float((mp == ml).mean())
+        r["multi_f1"] = float(f1_score(ml, mp, average="macro", zero_division=0))
+        r["multi_recall"] = float(recall_score(ml, mp, average="macro", zero_division=0))
     return r
 
 
@@ -383,7 +398,11 @@ def run_fold(fold, task, dataset, args, device):
         "test_loss": te_final["loss"],
         "train_loss": hist["train_loss"][-1],
         "binary_acc": te_final.get("binary_acc"),
+        "binary_f1": te_final.get("binary_f1"),
+        "binary_recall": te_final.get("binary_recall"),
         "multi_acc": te_final.get("multi_acc"),
+        "multi_f1": te_final.get("multi_f1"),
+        "multi_recall": te_final.get("multi_recall"),
         "history": hist,
     }
 
@@ -401,9 +420,12 @@ def run_task(task, dataset, args, device):
     for fold in range(args.num_folds):
         res = run_fold(fold, task, dataset, args, device)
         fold_results.append(res)
-        ba = f"  Bin {res['binary_acc']:.4f}" if res["binary_acc"] is not None else ""
-        ma = f"  Mul {res['multi_acc']:.4f}" if res["multi_acc"] is not None else ""
-        print(f"     Fold {fold+1} done — TestLoss {res['test_loss']:.4f}{ba}{ma}")
+        parts = [f"Fold {fold+1} done — TestLoss {res['test_loss']:.4f}"]
+        if res["binary_acc"] is not None:
+            parts.append(f"Bin Acc={res['binary_acc']:.4f} F1={res['binary_f1']:.4f} Recall={res['binary_recall']:.4f}")
+        if res["multi_acc"] is not None:
+            parts.append(f"Mul Acc={res['multi_acc']:.4f} F1={res['multi_f1']:.4f} Recall={res['multi_recall']:.4f}")
+        print(f"     {'  '.join(parts)}")
 
     return {"fold_results": fold_results}
 
@@ -422,25 +444,30 @@ def _fmt(values):
 
 
 def print_summary_table(all_results):
-    print(f"\n{'=' * 80}")
+    print(f"\n{'=' * 120}")
     print("  Results Table  (mean ± std across 5 folds)")
-    print(f"{'=' * 80}")
-    header = (f"  {'Task':<14s}  {'Binary Acc':<14s}  {'Multiclass Acc':<14s}"
-              f"  {'Test Loss':<14s}  {'Train Loss':<14s}")
+    print(f"{'=' * 120}")
+    header = (f"  {'Task':<12s}  {'Bin Acc':<14s}  {'Bin F1':<14s}  {'Bin Recall':<14s}"
+              f"  {'Mul Acc':<14s}  {'Mul F1':<14s}  {'Mul Recall':<14s}"
+              f"  {'Test Loss':<14s}")
     print(header)
-    print(f"  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*14}")
+    print(f"  {'─'*12}" + f"  {'─'*14}" * 7)
 
     for task in ALL_TASKS:
         if task not in all_results:
             continue
         folds = all_results[task]["fold_results"]
-        ba = _fmt([f["binary_acc"] for f in folds])
-        ma = _fmt([f["multi_acc"] for f in folds])
-        tl = _fmt([f["test_loss"] for f in folds])
-        trl = _fmt([f["train_loss"] for f in folds])
-        print(f"  {task:<14s}  {ba:<14s}  {ma:<14s}  {tl:<14s}  {trl:<14s}")
+        ba  = _fmt([f["binary_acc"]    for f in folds])
+        bf1 = _fmt([f["binary_f1"]     for f in folds])
+        br  = _fmt([f["binary_recall"] for f in folds])
+        ma  = _fmt([f["multi_acc"]     for f in folds])
+        mf1 = _fmt([f["multi_f1"]      for f in folds])
+        mr  = _fmt([f["multi_recall"]  for f in folds])
+        tl  = _fmt([f["test_loss"]     for f in folds])
+        print(f"  {task:<12s}  {ba:<14s}  {bf1:<14s}  {br:<14s}"
+              f"  {ma:<14s}  {mf1:<14s}  {mr:<14s}  {tl:<14s}")
 
-    print(f"{'=' * 80}")
+    print(f"{'=' * 120}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -667,18 +694,21 @@ def main():
     for task, tres in all_results.items():
         folds = tres["fold_results"]
         entry = {}
-        ba = [f["binary_acc"] for f in folds if f.get("binary_acc") is not None]
-        ma = [f["multi_acc"] for f in folds if f.get("multi_acc") is not None]
+
+        for key, prefix in [("binary_acc", "binary_acc"),
+                             ("binary_f1", "binary_f1"),
+                             ("binary_recall", "binary_recall"),
+                             ("multi_acc", "multi_acc"),
+                             ("multi_f1", "multi_f1"),
+                             ("multi_recall", "multi_recall")]:
+            vals = [f[key] for f in folds if f.get(key) is not None]
+            if vals:
+                entry[f"{prefix}_mean"] = float(np.mean(vals))
+                entry[f"{prefix}_std"] = float(np.std(vals))
+                entry[f"{prefix}_per_fold"] = vals
+
         tl = [f["test_loss"] for f in folds]
         trl = [f["train_loss"] for f in folds]
-        if ba:
-            entry["binary_acc_mean"] = float(np.mean(ba))
-            entry["binary_acc_std"] = float(np.std(ba))
-            entry["binary_acc_per_fold"] = ba
-        if ma:
-            entry["multi_acc_mean"] = float(np.mean(ma))
-            entry["multi_acc_std"] = float(np.std(ma))
-            entry["multi_acc_per_fold"] = ma
         entry["test_loss_mean"] = float(np.mean(tl))
         entry["test_loss_std"] = float(np.std(tl))
         entry["train_loss_mean"] = float(np.mean(trl))
