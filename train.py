@@ -8,13 +8,20 @@ Tasks (following the original paper):
 
 Optional optimisations (all OFF by default for baseline reproducibility):
   --weighted_loss   sqrt-inverse-frequency class weights + label smoothing
-  --augment         online data augmentation (Gaussian noise + channel scaling)
   --deep_head       deeper classification head (hidden layer + dropout)
 
+Data augmentation (individually selectable, or --augment to enable all):
+  --aug_noise       Gaussian noise injection
+  --aug_scale       per-channel random scaling
+  --aug_wslice      Window Slice (random crop + resize)
+  --aug_timewarp    TimeWarp (smooth non-linear time distortion)
+  --augment         convenience flag — enables all four above
+
 Usage:
-    python train.py                                        # baseline, all 3 tasks
-    python train.py --weighted_loss --augment --deep_head  # all optimisations
-    python train.py --tasks multiclass --augment           # single task + augment
+    python train.py                                            # baseline
+    python train.py --augment                                  # all augmentations
+    python train.py --aug_noise --aug_wslice                   # pick specific ones
+    python train.py --weighted_loss --augment --deep_head      # all optimisations
     python train.py --epochs 100 --batch_size 32
 """
 
@@ -32,6 +39,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_loader import NGAFIDDataset
@@ -66,20 +74,84 @@ def compute_class_weights(
     return weights / weights.sum() * num_classes
 
 
-def augment_batch(X: torch.Tensor) -> torch.Tensor:
-    """Vectorised online augmentation (applied per-sample stochastically)."""
+def aug_noise(X: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
+    """Add Gaussian noise to ~50 % of samples."""
+    B = X.size(0)
+    mask = (torch.rand(B, 1, 1, device=X.device) < 0.5).float()
+    return X + torch.randn_like(X) * sigma * mask
+
+
+def aug_scale(X: torch.Tensor, lo: float = 0.9, hi: float = 1.1) -> torch.Tensor:
+    """Per-channel random scaling in [lo, hi] for ~50 % of samples."""
     B, _T, C = X.shape
+    mask = (torch.rand(B, 1, 1, device=X.device) < 0.5).float()
+    s = lo + torch.rand(B, 1, C, device=X.device) * (hi - lo)
+    return X * (1.0 - mask + mask * s)
+
+
+def aug_window_slice(X: torch.Tensor, min_ratio: float = 0.8) -> torch.Tensor:
+    """Randomly crop a contiguous sub-window and resize back to original length.
+    Same window for the whole batch (vectorised)."""
+    B, T, C = X.shape
+    win_len = random.randint(int(T * min_ratio), T)
+    start = random.randint(0, T - win_len)
+    sliced = X[:, start : start + win_len, :]          # (B, win_len, C)
+    sliced = sliced.permute(0, 2, 1)                   # (B, C, win_len)
+    resized = F.interpolate(sliced, size=T, mode="linear", align_corners=False)
+    return resized.permute(0, 2, 1)                    # (B, T, C)
+
+
+def aug_time_warp(
+    X: torch.Tensor, sigma: float = 0.2, num_knots: int = 4
+) -> torch.Tensor:
+    """Smooth non-linear time distortion via random cubic-spline-like warping.
+    Each sample gets an independent warp (vectorised with grid_sample)."""
+    B, T, C = X.shape
     device = X.device
 
-    # Gaussian noise, sigma=0.02 (50 % of samples)
-    mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
-    X = X + torch.randn_like(X) * 0.02 * mask
+    # Uniform knot positions + random perturbation on interior knots
+    knots = torch.linspace(0, T - 1, num_knots + 2, device=device)
+    knots = knots.unsqueeze(0).expand(B, -1).clone()   # (B, K)
+    spacing = (T - 1) / (num_knots + 1)
+    knots[:, 1:-1] += torch.randn(B, num_knots, device=device) * sigma * spacing
 
-    # Per-channel random scaling in [0.9, 1.1] (50 % of samples)
-    mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
-    scale = 0.9 + torch.rand(B, 1, C, device=device) * 0.2
-    X = X * (1.0 - mask + mask * scale)
+    # Sort to guarantee monotonicity, clamp to valid range
+    knots, _ = knots.sort(dim=1)
+    knots = knots.clamp(0, T - 1)
 
+    # Interpolate knots → full-length warp path  (B, T)
+    warp = F.interpolate(
+        knots.unsqueeze(1), size=T, mode="linear", align_corners=True
+    ).squeeze(1)
+
+    # Build grid for grid_sample:  warp ∈ [0, T-1] → normalise to [-1, 1]
+    grid = (warp / (T - 1) * 2 - 1)                    # (B, T)
+    grid = grid.view(B, 1, T, 1).expand(-1, -1, -1, 2).clone()
+    grid[..., 1] = 0                                    # y-coordinate unused
+
+    X_4d = X.permute(0, 2, 1).unsqueeze(2)             # (B, C, 1, T)
+    warped = F.grid_sample(
+        X_4d, grid, mode="bilinear", padding_mode="border", align_corners=True
+    )
+    return warped.squeeze(2).permute(0, 2, 1)           # (B, T, C)
+
+
+def augment_batch(
+    X: torch.Tensor,
+    do_noise: bool = False,
+    do_scale: bool = False,
+    do_wslice: bool = False,
+    do_timewarp: bool = False,
+) -> torch.Tensor:
+    """Apply selected augmentations sequentially."""
+    if do_noise:
+        X = aug_noise(X)
+    if do_scale:
+        X = aug_scale(X)
+    if do_wslice:
+        X = aug_window_slice(X)
+    if do_timewarp:
+        X = aug_time_warp(X)
     return X
 
 
@@ -88,14 +160,14 @@ def augment_batch(X: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, task, criterions, optimizer, scheduler,
-                    device, do_augment: bool):
+                    device, aug_flags: dict):
     model.train()
     loss_sum, bin_ok, multi_ok, n = 0.0, 0, 0, 0
 
     for X, y_bin, y_multi in loader:
         X = X.to(device)
-        if do_augment:
-            X = augment_batch(X)
+        if any(aug_flags.values()):
+            X = augment_batch(X, **aug_flags)
         y_bin, y_multi = y_bin.to(device), y_multi.to(device)
         optimizer.zero_grad()
 
@@ -239,11 +311,18 @@ def run_fold(fold, task, dataset, args, device):
         "test_binary_acc": [], "test_multi_acc": [],
     }
 
+    aug_flags = {
+        "do_noise": args.aug_noise,
+        "do_scale": args.aug_scale,
+        "do_wslice": args.aug_wslice,
+        "do_timewarp": args.aug_timewarp,
+    }
+
     fold_start = time.time()
     for epoch in range(args.epochs):
         tr = train_one_epoch(model, train_loader, task, criterions,
                              optimizer, scheduler, device,
-                             do_augment=args.augment)
+                             aug_flags=aug_flags)
         hist["train_loss"].append(tr["loss"])
         hist["train_binary_acc"].append(tr.get("binary_acc"))
         hist["train_multi_acc"].append(tr.get("multi_acc"))
@@ -510,10 +589,20 @@ def main():
     # optimisations (all OFF by default)
     parser.add_argument("--weighted_loss", action="store_true",
                         help="Enable sqrt-inverse-frequency class weights + label smoothing")
-    parser.add_argument("--augment", action="store_true",
-                        help="Enable online data augmentation (noise + channel scaling)")
     parser.add_argument("--deep_head", action="store_true",
                         help="Enable deeper classification head (Linear-GELU-Dropout-Linear)")
+
+    # data augmentation (individually selectable)
+    parser.add_argument("--augment", action="store_true",
+                        help="Convenience flag: enable ALL four augmentations below")
+    parser.add_argument("--aug_noise", action="store_true",
+                        help="Gaussian noise injection (sigma=0.02)")
+    parser.add_argument("--aug_scale", action="store_true",
+                        help="Per-channel random scaling [0.9, 1.1]")
+    parser.add_argument("--aug_wslice", action="store_true",
+                        help="Window Slice: random crop 80-100%% + resize")
+    parser.add_argument("--aug_timewarp", action="store_true",
+                        help="TimeWarp: smooth non-linear time distortion")
 
     # misc
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -521,16 +610,29 @@ def main():
 
     args = parser.parse_args()
 
+    # --augment is a convenience shortcut for all four augmentations
+    if args.augment:
+        args.aug_noise = True
+        args.aug_scale = True
+        args.aug_wslice = True
+        args.aug_timewarp = True
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name()}")
 
+    any_aug = args.aug_noise or args.aug_scale or args.aug_wslice or args.aug_timewarp
     print(f"\nOptimisations:")
     print(f"  --weighted_loss : {'ON' if args.weighted_loss else 'OFF'}")
-    print(f"  --augment       : {'ON' if args.augment else 'OFF'}")
     print(f"  --deep_head     : {'ON' if args.deep_head else 'OFF'}")
+    print(f"  Augmentation    : {'OFF' if not any_aug else ''}")
+    if any_aug:
+        print(f"    --aug_noise   : {'ON' if args.aug_noise else 'OFF'}")
+        print(f"    --aug_scale   : {'ON' if args.aug_scale else 'OFF'}")
+        print(f"    --aug_wslice  : {'ON' if args.aug_wslice else 'OFF'}")
+        print(f"    --aug_timewarp: {'ON' if args.aug_timewarp else 'OFF'}")
 
     print("\nLoading NGAFID dataset …")
     dataset = NGAFIDDataset(name=args.data_name, destination=args.data_dir)
