@@ -3,22 +3,24 @@
 
 Tasks (following the original paper):
   1. binary      — maintenance issue detection   (before=1 / after=0)
-  2. multiclass  — maintenance issue classification (after→class 0, before→class 1-19)
+  2. multiclass  — maintenance issue classification (after->class 0, before->class 1-19)
   3. combined    — joint detection + classification (two-head model)
 
-Optimisations applied:
-  - Weighted CrossEntropyLoss (inverse-frequency) + label smoothing 0.1
-  - Online data augmentation  (Gaussian noise + per-channel scaling)
-  - Deeper classification head (hidden layer + 0.3 dropout)
+Optional optimisations (all OFF by default for baseline reproducibility):
+  --weighted_loss   sqrt-inverse-frequency class weights + label smoothing
+  --augment         online data augmentation (Gaussian noise + channel scaling)
+  --deep_head       deeper classification head (hidden layer + dropout)
 
 Usage:
-    python train.py                          # train all 3 tasks, 200 epochs
-    python train.py --tasks binary multiclass
+    python train.py                                        # baseline, all 3 tasks
+    python train.py --weighted_loss --augment --deep_head  # all optimisations
+    python train.py --tasks multiclass --augment           # single task + augment
     python train.py --epochs 100 --batch_size 32
 """
 
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -54,9 +56,10 @@ def set_seed(seed: int = 42):
 def compute_class_weights(
     y: np.ndarray, num_classes: int, device: torch.device
 ) -> torch.Tensor:
+    """Sqrt-inverse-frequency weights — much gentler than raw inverse frequency."""
     counts = Counter(y.tolist())
     weights = torch.tensor(
-        [1.0 / max(counts.get(i, 1), 1) for i in range(num_classes)],
+        [1.0 / math.sqrt(max(counts.get(i, 1), 1)) for i in range(num_classes)],
         dtype=torch.float32,
         device=device,
     )
@@ -68,13 +71,13 @@ def augment_batch(X: torch.Tensor) -> torch.Tensor:
     B, _T, C = X.shape
     device = X.device
 
-    # Gaussian noise (50 % of samples)
+    # Gaussian noise, sigma=0.02 (50 % of samples)
     mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
-    X = X + torch.randn_like(X) * 0.05 * mask
+    X = X + torch.randn_like(X) * 0.02 * mask
 
-    # Per-channel random scaling in [0.8, 1.2] (50 % of samples)
+    # Per-channel random scaling in [0.9, 1.1] (50 % of samples)
     mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
-    scale = 0.8 + torch.rand(B, 1, C, device=device) * 0.4
+    scale = 0.9 + torch.rand(B, 1, C, device=device) * 0.2
     X = X * (1.0 - mask + mask * scale)
 
     return X
@@ -84,12 +87,15 @@ def augment_batch(X: torch.Tensor) -> torch.Tensor:
 #  Train / Evaluate one epoch
 # ──────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, task, criterions, optimizer, scheduler, device):
+def train_one_epoch(model, loader, task, criterions, optimizer, scheduler,
+                    device, do_augment: bool):
     model.train()
     loss_sum, bin_ok, multi_ok, n = 0.0, 0, 0, 0
 
     for X, y_bin, y_multi in loader:
-        X = augment_batch(X.to(device))
+        X = X.to(device)
+        if do_augment:
+            X = augment_batch(X)
         y_bin, y_multi = y_bin.to(device), y_multi.to(device)
         optimizer.zero_grad()
 
@@ -155,6 +161,31 @@ def evaluate(model, loader, task, criterions, device):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Build loss functions
+# ──────────────────────────────────────────────────────────────
+
+def build_criterions(task, train_yb, train_ym, num_classes, device,
+                     weighted_loss: bool):
+    criterions = {}
+
+    if task in ("binary", "combined"):
+        kwargs = {}
+        if weighted_loss:
+            kwargs["weight"] = compute_class_weights(train_yb, 2, device)
+            kwargs["label_smoothing"] = 0.1
+        criterions["binary"] = nn.CrossEntropyLoss(**kwargs)
+
+    if task in ("multiclass", "combined"):
+        kwargs = {}
+        if weighted_loss:
+            kwargs["weight"] = compute_class_weights(train_ym, num_classes, device)
+            kwargs["label_smoothing"] = 0.05
+        criterions["multi"] = nn.CrossEntropyLoss(**kwargs)
+
+    return criterions
+
+
+# ──────────────────────────────────────────────────────────────
 #  Run one fold
 # ──────────────────────────────────────────────────────────────
 
@@ -186,15 +217,13 @@ def run_fold(fold, task, dataset, args, device):
         num_encoder_layers=args.num_encoder_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout, task=task,
+        deep_head=args.deep_head, head_dropout=0.15,
     ).to(device)
 
-    criterions = {}
-    if task in ("binary", "combined"):
-        w = compute_class_weights(train_yb, 2, device)
-        criterions["binary"] = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
-    if task in ("multiclass", "combined"):
-        w = compute_class_weights(train_ym, dataset.num_classes, device)
-        criterions["multi"] = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+    criterions = build_criterions(
+        task, train_yb, train_ym, dataset.num_classes, device,
+        weighted_loss=args.weighted_loss,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.max_lr, weight_decay=args.weight_decay
@@ -213,7 +242,8 @@ def run_fold(fold, task, dataset, args, device):
     fold_start = time.time()
     for epoch in range(args.epochs):
         tr = train_one_epoch(model, train_loader, task, criterions,
-                             optimizer, scheduler, device)
+                             optimizer, scheduler, device,
+                             do_augment=args.augment)
         hist["train_loss"].append(tr["loss"])
         hist["train_binary_acc"].append(tr.get("binary_acc"))
         hist["train_multi_acc"].append(tr.get("multi_acc"))
@@ -298,7 +328,7 @@ def run_task(task, dataset, args, device):
 # ──────────────────────────────────────────────────────────────
 
 def _fmt(values):
-    """Format mean±std from a list of floats (or return '—' if empty)."""
+    """Format mean +/- std from a list of floats (or return '-' if empty)."""
     vals = [v for v in values if v is not None]
     if not vals:
         return "—"
@@ -424,7 +454,7 @@ def print_dataset_info(dataset: NGAFIDDataset):
     class_counts = header["target_class"].value_counts().sort_index()
     print(f"\n  [target_class distribution]  ({dataset.num_classes} classes)")
     for orig, cnt in class_counts.items():
-        print(f"    {orig:>3d} → idx {dataset._label2idx[orig]:<3d}  ({cnt} samples)")
+        print(f"    {orig:>3d} -> idx {dataset._label2idx[orig]:<3d}  ({cnt} samples)")
 
     first = dataset._data_dict[0]
     raw = first["data"]
@@ -477,6 +507,14 @@ def main():
     parser.add_argument("--tasks", nargs="+", default=ALL_TASKS,
                         choices=ALL_TASKS, help="Which tasks to train")
 
+    # optimisations (all OFF by default)
+    parser.add_argument("--weighted_loss", action="store_true",
+                        help="Enable sqrt-inverse-frequency class weights + label smoothing")
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable online data augmentation (noise + channel scaling)")
+    parser.add_argument("--deep_head", action="store_true",
+                        help="Enable deeper classification head (Linear-GELU-Dropout-Linear)")
+
     # misc
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--log_interval", type=int, default=10)
@@ -488,6 +526,11 @@ def main():
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name()}")
+
+    print(f"\nOptimisations:")
+    print(f"  --weighted_loss : {'ON' if args.weighted_loss else 'OFF'}")
+    print(f"  --augment       : {'ON' if args.augment else 'OFF'}")
+    print(f"  --deep_head     : {'ON' if args.deep_head else 'OFF'}")
 
     print("\nLoading NGAFID dataset …")
     dataset = NGAFIDDataset(name=args.data_name, destination=args.data_dir)

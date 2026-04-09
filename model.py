@@ -27,22 +27,16 @@ class CNNFeatureExtractor(nn.Module):
         return self.layers(x)
 
 
-def _make_head(d_model: int, num_classes: int, dropout: float = 0.3) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(d_model, d_model // 2),
-        nn.GELU(),
-        nn.Dropout(dropout),
-        nn.Linear(d_model // 2, num_classes),
-    )
-
-
 class CNNTransformerClassifier(nn.Module):
     """
     CNN feature extractor  +  Transformer encoder  +  task-specific head(s).
 
-    task="binary"      → single head, 2 classes  (before / after maintenance)
-    task="multiclass"  → single head, num_classes (maintenance issue type)
-    task="combined"    → two heads, joint binary + multiclass
+    task="binary"      -> single head, 2 classes  (before / after maintenance)
+    task="multiclass"  -> single head, num_classes (maintenance issue type)
+    task="combined"    -> two heads, joint binary + multiclass
+
+    deep_head=False -> simple Linear (baseline)
+    deep_head=True  -> Linear -> GELU -> Dropout -> Linear
     """
 
     def __init__(
@@ -56,6 +50,8 @@ class CNNTransformerClassifier(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = 512,
         task: str = "multiclass",
+        deep_head: bool = False,
+        head_dropout: float = 0.15,
     ):
         super().__init__()
         self.task = task
@@ -79,14 +75,23 @@ class CNNTransformerClassifier(nn.Module):
         )
         self.norm = nn.LayerNorm(d_model)
 
-        head_dropout = 0.3
+        def _make_head(out_dim: int) -> nn.Module:
+            if deep_head:
+                return nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.GELU(),
+                    nn.Dropout(head_dropout),
+                    nn.Linear(d_model // 2, out_dim),
+                )
+            return nn.Linear(d_model, out_dim)
+
         if task == "binary":
-            self.head = _make_head(d_model, 2, head_dropout)
+            self.head = _make_head(2)
         elif task == "multiclass":
-            self.head = _make_head(d_model, num_classes, head_dropout)
+            self.head = _make_head(num_classes)
         elif task == "combined":
-            self.binary_head = _make_head(d_model, 2, head_dropout)
-            self.multi_head = _make_head(d_model, num_classes, head_dropout)
+            self.binary_head = _make_head(2)
+            self.multi_head = _make_head(num_classes)
         else:
             raise ValueError(f"Unknown task: {task}")
 
