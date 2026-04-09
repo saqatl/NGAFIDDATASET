@@ -213,6 +213,7 @@ def run_fold(
     )
 
     best_acc = 0.0
+    fold_start = time.time()
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device
@@ -222,11 +223,17 @@ def run_fold(
             test_loss, test_acc = evaluate(model, test_loader, criterion, device)
             best_acc = max(best_acc, test_acc)
             lr = scheduler.get_last_lr()[0]
+            
+            elapsed = time.time() - fold_start
+            avg_per_epoch = elapsed / (epoch + 1)
+            remaining = avg_per_epoch * (args.epochs - epoch - 1)
+            eta_min, eta_sec = divmod(int(remaining), 60)
             print(
                 f"  Epoch {epoch + 1:3d}/{args.epochs}"
                 f"  | Train loss {train_loss:.4f}  acc {train_acc:.4f}"
                 f"  | Test  loss {test_loss:.4f}  acc {test_acc:.4f}"
                 f"  | lr {lr:.2e}"
+                f"  | ETA {eta_min}m{eta_sec:02d}s"
             )
 
     # Final evaluation
