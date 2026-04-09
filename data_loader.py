@@ -30,7 +30,16 @@ def _download_and_extract(name: str = "2days", destination: str = ""):
 
     if not os.path.exists(archive):
         print(f"Downloading {name} dataset from Zenodo …")
-        urllib.request.urlretrieve(url, archive)
+        response = urllib.request.urlopen(url)
+        total = int(response.headers.get("Content-Length", 0))
+        with tqdm(total=total, unit="B", unit_scale=True, desc=name) as pbar:
+            with open(archive, "wb") as f:
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    pbar.update(len(chunk))
         print(f"Saved → {archive}")
 
     if not os.path.isdir(data_dir):
