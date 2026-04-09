@@ -1,11 +1,20 @@
 """
-5-Fold Cross-Validation training script for the CNN + Transformer classifier
-on the NGAFID 2-days benchmark dataset.
+5-Fold CV training for 3 tasks on the NGAFID 2-days benchmark dataset.
+
+Tasks (following the original paper):
+  1. binary      — maintenance issue detection   (before=1 / after=0)
+  2. multiclass  — maintenance issue classification (after→class 0, before→class 1-19)
+  3. combined    — joint detection + classification (two-head model)
+
+Optimisations applied:
+  - Weighted CrossEntropyLoss (inverse-frequency) + label smoothing 0.1
+  - Online data augmentation  (Gaussian noise + per-channel scaling)
+  - Deeper classification head (hidden layer + 0.3 dropout)
 
 Usage:
-    python train.py                     # default settings
-    python train.py --epochs 100        # override epochs
-    python train.py --batch_size 32     # override batch size
+    python train.py                          # train all 3 tasks, 200 epochs
+    python train.py --tasks binary multiclass
+    python train.py --epochs 100 --batch_size 32
 """
 
 import argparse
@@ -13,7 +22,11 @@ import json
 import os
 import random
 import time
+from collections import Counter
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,84 +35,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from data_loader import NGAFIDDataset
 from model import CNNTransformerClassifier
 
+ALL_TASKS = ["binary", "multiclass", "combined"]
 
-def print_dataset_info(dataset: NGAFIDDataset):
-    """Print dataset structure, label distribution, and the first sample."""
-    header = dataset.flight_header
 
-    print(f"\n{'=' * 60}")
-    print("  Dataset Structure Overview")
-    print(f"{'=' * 60}")
-
-    # flight_header schema
-    print("\n  [flight_header.csv]")
-    print(f"    Shape: {header.shape}  (rows × columns)")
-    print(f"    Columns & dtypes:")
-    for col in header.columns:
-        print(f"      {col:<25s}  {header[col].dtype}")
-    print(f"\n    First 3 rows:")
-    print(header.head(3).to_string(max_colwidth=30).replace("\n", "\n    "))
-
-    # fold distribution
-    fold_counts = header["fold"].value_counts().sort_index()
-    print(f"\n  [Fold distribution]")
-    for fold_id, cnt in fold_counts.items():
-        print(f"    Fold {fold_id}: {cnt} samples")
-
-    # label distribution
-    class_counts = header["target_class"].value_counts().sort_index()
-    print(f"\n  [target_class distribution]  ({dataset.num_classes} unique classes)")
-    print(f"    {'original_label':<16s} → {'mapped_idx':<10s}  count")
-    for orig_label, cnt in class_counts.items():
-        mapped = dataset._label2idx[orig_label]
-        print(f"    {str(orig_label):<16s} → {mapped:<10d}  {cnt}")
-
-    # normalization stats
-    print(f"\n  [Normalization stats]  (per-channel min / max, 23 channels)")
-    print(f"    mins : {dataset.mins[:5]} ... (showing first 5)")
-    print(f"    maxs : {dataset.maxs[:5]} ... (showing first 5)")
-
-    # first raw sample
-    first = dataset._data_dict[0]
-    raw_data = first["data"]
-    print(f"\n{'=' * 60}")
-    print("  First Sample (raw, before normalization)")
-    print(f"{'=' * 60}")
-    print(f"    target_class : {first['target_class']}")
-    print(f"    fold         : {first['fold']}")
-    print(f"    data shape   : {raw_data.shape}  (time_steps × channels)")
-    print(f"    data dtype   : {raw_data.dtype}")
-
-    nonzero_mask = np.any(raw_data != 0, axis=1)
-    actual_len = int(nonzero_mask.sum())
-    print(f"    actual length: {actual_len}  (non-zero rows out of {raw_data.shape[0]})")
-    print(f"    padding rows : {raw_data.shape[0] - actual_len}")
-
-    print(f"\n    data[0, :5]  (first timestep, first 5 channels):")
-    print(f"      {raw_data[0, :5]}")
-    first_nonzero = np.argmax(nonzero_mask) if actual_len > 0 else 0
-    print(f"    data[{first_nonzero}, :5]  (first non-zero row, first 5 channels):")
-    print(f"      {raw_data[first_nonzero, :5]}")
-    print(f"    data[-1, :5] (last timestep, first 5 channels):")
-    print(f"      {raw_data[-1, :5]}")
-
-    # first normalized sample
-    X_sample, y_sample = dataset.get_fold_data(first["fold"], training=False)
-    print(f"\n{'=' * 60}")
-    print("  First Sample (after min-max normalization)")
-    print(f"{'=' * 60}")
-    print(f"    X shape : {X_sample.shape}  (num_samples_in_fold × time_steps × channels)")
-    print(f"    X dtype : {X_sample.dtype}")
-    print(f"    y shape : {y_sample.shape}")
-    print(f"    y dtype : {y_sample.dtype}")
-    print(f"    y[0]    : {y_sample[0]}  (mapped label)")
-    print(f"    X[0] value range: [{X_sample[0].min():.4f}, {X_sample[0].max():.4f}]")
-    print(f"    X[0, 0, :5] (first timestep, first 5 channels):")
-    print(f"      {X_sample[0, 0, :5]}")
-    print(f"    X[0, -1, :5] (last timestep, first 5 channels):")
-    print(f"      {X_sample[0, -1, :5]}")
-    print()
-
+# ──────────────────────────────────────────────────────────────
+#  Helpers
+# ──────────────────────────────────────────────────────────────
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -110,157 +51,410 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    device: torch.device,
-) -> tuple[float, float]:
+def compute_class_weights(
+    y: np.ndarray, num_classes: int, device: torch.device
+) -> torch.Tensor:
+    counts = Counter(y.tolist())
+    weights = torch.tensor(
+        [1.0 / max(counts.get(i, 1), 1) for i in range(num_classes)],
+        dtype=torch.float32,
+        device=device,
+    )
+    return weights / weights.sum() * num_classes
+
+
+def augment_batch(X: torch.Tensor) -> torch.Tensor:
+    """Vectorised online augmentation (applied per-sample stochastically)."""
+    B, _T, C = X.shape
+    device = X.device
+
+    # Gaussian noise (50 % of samples)
+    mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
+    X = X + torch.randn_like(X) * 0.05 * mask
+
+    # Per-channel random scaling in [0.8, 1.2] (50 % of samples)
+    mask = (torch.rand(B, 1, 1, device=device) < 0.5).float()
+    scale = 0.8 + torch.rand(B, 1, C, device=device) * 0.4
+    X = X * (1.0 - mask + mask * scale)
+
+    return X
+
+
+# ──────────────────────────────────────────────────────────────
+#  Train / Evaluate one epoch
+# ──────────────────────────────────────────────────────────────
+
+def train_one_epoch(model, loader, task, criterions, optimizer, scheduler, device):
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
+    loss_sum, bin_ok, multi_ok, n = 0.0, 0, 0, 0
+
+    for X, y_bin, y_multi in loader:
+        X = augment_batch(X.to(device))
+        y_bin, y_multi = y_bin.to(device), y_multi.to(device)
         optimizer.zero_grad()
-        logits = model(X)
-        loss = criterion(logits, y)
+
+        if task == "binary":
+            logits = model(X)
+            loss = criterions["binary"](logits, y_bin)
+            bin_ok += (logits.argmax(1) == y_bin).sum().item()
+        elif task == "multiclass":
+            logits = model(X)
+            loss = criterions["multi"](logits, y_multi)
+            multi_ok += (logits.argmax(1) == y_multi).sum().item()
+        else:
+            bl, ml = model(X)
+            loss = criterions["binary"](bl, y_bin) + criterions["multi"](ml, y_multi)
+            bin_ok += (bl.argmax(1) == y_bin).sum().item()
+            multi_ok += (ml.argmax(1) == y_multi).sum().item()
+
         loss.backward()
         optimizer.step()
         scheduler.step()
+        loss_sum += loss.item() * X.size(0)
+        n += X.size(0)
 
-        total_loss += loss.item() * X.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
-        total += X.size(0)
-
-    return total_loss / total, correct / total
+    r = {"loss": loss_sum / n}
+    if task in ("binary", "combined"):
+        r["binary_acc"] = bin_ok / n
+    if task in ("multiclass", "combined"):
+        r["multi_acc"] = multi_ok / n
+    return r
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, float]:
+def evaluate(model, loader, task, criterions, device):
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
-        logits = model(X)
-        loss = criterion(logits, y)
+    loss_sum, bin_ok, multi_ok, n = 0.0, 0, 0, 0
 
-        total_loss += loss.item() * X.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
-        total += X.size(0)
+    for X, y_bin, y_multi in loader:
+        X, y_bin, y_multi = X.to(device), y_bin.to(device), y_multi.to(device)
 
-    return total_loss / total, correct / total
+        if task == "binary":
+            logits = model(X)
+            loss = criterions["binary"](logits, y_bin)
+            bin_ok += (logits.argmax(1) == y_bin).sum().item()
+        elif task == "multiclass":
+            logits = model(X)
+            loss = criterions["multi"](logits, y_multi)
+            multi_ok += (logits.argmax(1) == y_multi).sum().item()
+        else:
+            bl, ml = model(X)
+            loss = criterions["binary"](bl, y_bin) + criterions["multi"](ml, y_multi)
+            bin_ok += (bl.argmax(1) == y_bin).sum().item()
+            multi_ok += (ml.argmax(1) == y_multi).sum().item()
+
+        loss_sum += loss.item() * X.size(0)
+        n += X.size(0)
+
+    r = {"loss": loss_sum / n}
+    if task in ("binary", "combined"):
+        r["binary_acc"] = bin_ok / n
+    if task in ("multiclass", "combined"):
+        r["multi_acc"] = multi_ok / n
+    return r
 
 
-def run_fold(
-    fold: int,
-    dataset: NGAFIDDataset,
-    args: argparse.Namespace,
-    device: torch.device,
-) -> float:
-    print(f"\n{'=' * 60}")
-    print(f"  Fold {fold + 1} / {args.num_folds}")
-    print(f"{'=' * 60}")
+# ──────────────────────────────────────────────────────────────
+#  Run one fold
+# ──────────────────────────────────────────────────────────────
 
-    train_X, train_y = dataset.get_fold_data(fold, training=True)
-    test_X, test_y = dataset.get_fold_data(fold, training=False)
+def run_fold(fold, task, dataset, args, device):
+    print(f"\n  ── Fold {fold + 1}/{args.num_folds} ──")
 
-    print(
-        f"  Train: {len(train_y)} samples  |  Test: {len(test_y)} samples  |"
-        f"  Classes: {dataset.num_classes}"
-    )
+    train_X, train_yb, train_ym = dataset.get_fold_data(fold, training=True)
+    test_X, test_yb, test_ym = dataset.get_fold_data(fold, training=False)
+    print(f"     Train {len(train_yb)}  |  Test {len(test_yb)}")
 
-    train_ds = TensorDataset(
-        torch.from_numpy(train_X), torch.from_numpy(train_y)
-    )
-    test_ds = TensorDataset(
-        torch.from_numpy(test_X), torch.from_numpy(test_y)
-    )
-    # num_workers=0 for Windows compatibility
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        TensorDataset(torch.from_numpy(train_X),
+                       torch.from_numpy(train_yb),
+                       torch.from_numpy(train_ym)),
+        batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=device.type == "cuda",
     )
     test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
+        TensorDataset(torch.from_numpy(test_X),
+                       torch.from_numpy(test_yb),
+                       torch.from_numpy(test_ym)),
+        batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=device.type == "cuda",
     )
 
     model = CNNTransformerClassifier(
-        in_channels=23,
-        num_classes=dataset.num_classes,
-        d_model=args.d_model,
-        nhead=args.nhead,
+        in_channels=23, num_classes=dataset.num_classes,
+        d_model=args.d_model, nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
+        dropout=args.dropout, task=task,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    criterions = {}
+    if task in ("binary", "combined"):
+        w = compute_class_weights(train_yb, 2, device)
+        criterions["binary"] = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+    if task in ("multiclass", "combined"):
+        w = compute_class_weights(train_ym, dataset.num_classes, device)
+        criterions["multi"] = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.max_lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.max_lr,
-        steps_per_epoch=len(train_loader),
-        epochs=args.epochs,
+        optimizer, max_lr=args.max_lr,
+        steps_per_epoch=len(train_loader), epochs=args.epochs,
     )
 
-    best_acc = 0.0
+    hist = {
+        "train_loss": [], "test_loss": [], "test_epochs": [],
+        "train_binary_acc": [], "train_multi_acc": [],
+        "test_binary_acc": [], "test_multi_acc": [],
+    }
+
     fold_start = time.time()
     for epoch in range(args.epochs):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device
-        )
+        tr = train_one_epoch(model, train_loader, task, criterions,
+                             optimizer, scheduler, device)
+        hist["train_loss"].append(tr["loss"])
+        hist["train_binary_acc"].append(tr.get("binary_acc"))
+        hist["train_multi_acc"].append(tr.get("multi_acc"))
 
-        if (epoch + 1) % args.log_interval == 0 or epoch == 0:
-            test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-            best_acc = max(best_acc, test_acc)
-            lr = scheduler.get_last_lr()[0]
-            
+        do_eval = (epoch + 1) % args.log_interval == 0 or epoch == 0
+        if do_eval:
+            te = evaluate(model, test_loader, task, criterions, device)
+            hist["test_loss"].append(te["loss"])
+            hist["test_epochs"].append(epoch)
+            hist["test_binary_acc"].append(te.get("binary_acc"))
+            hist["test_multi_acc"].append(te.get("multi_acc"))
+
             elapsed = time.time() - fold_start
-            avg_per_epoch = elapsed / (epoch + 1)
-            remaining = avg_per_epoch * (args.epochs - epoch - 1)
-            eta_min, eta_sec = divmod(int(remaining), 60)
-            print(
-                f"  Epoch {epoch + 1:3d}/{args.epochs}"
-                f"  | Train loss {train_loss:.4f}  acc {train_acc:.4f}"
-                f"  | Test  loss {test_loss:.4f}  acc {test_acc:.4f}"
-                f"  | lr {lr:.2e}"
-                f"  | ETA {eta_min}m{eta_sec:02d}s"
-            )
+            eta = elapsed / (epoch + 1) * (args.epochs - epoch - 1)
+            eta_m, eta_s = divmod(int(eta), 60)
 
-    # Final evaluation
-    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-    best_acc = max(best_acc, test_acc)
-    print(f"\n  Fold {fold + 1} — final test accuracy: {test_acc:.4f}  (best: {best_acc:.4f})")
+            parts = [f"Ep {epoch+1:3d}/{args.epochs}"]
+            parts.append(f"TrL {tr['loss']:.4f}")
+            if tr.get("binary_acc") is not None:
+                parts.append(f"TrBin {tr['binary_acc']:.4f}")
+            if tr.get("multi_acc") is not None:
+                parts.append(f"TrMul {tr['multi_acc']:.4f}")
+            parts.append(f"TeL {te['loss']:.4f}")
+            if te.get("binary_acc") is not None:
+                parts.append(f"TeBin {te['binary_acc']:.4f}")
+            if te.get("multi_acc") is not None:
+                parts.append(f"TeMul {te['multi_acc']:.4f}")
+            parts.append(f"ETA {eta_m}m{eta_s:02d}s")
+            print("     " + "  ".join(parts))
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.checkpoint_dir, f"fold_{fold}.pt")
-    torch.save(
-        {
-            "fold": fold,
-            "model_state_dict": model.state_dict(),
-            "num_classes": dataset.num_classes,
-            "label_map": dataset.label_map,
-            "test_accuracy": test_acc,
-            "args": vars(args),
-        },
-        ckpt_path,
-    )
-    print(f"  Checkpoint saved → {ckpt_path}")
+    # final eval
+    te_final = evaluate(model, test_loader, task, criterions, device)
+    if not hist["test_epochs"] or hist["test_epochs"][-1] != args.epochs - 1:
+        hist["test_loss"].append(te_final["loss"])
+        hist["test_epochs"].append(args.epochs - 1)
+        hist["test_binary_acc"].append(te_final.get("binary_acc"))
+        hist["test_multi_acc"].append(te_final.get("multi_acc"))
 
-    return test_acc
+    # save checkpoint
+    ckpt_dir = os.path.join(args.checkpoint_dir, task)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"fold_{fold}.pt")
+    torch.save({
+        "fold": fold, "task": task,
+        "model_state_dict": model.state_dict(),
+        "num_classes": dataset.num_classes,
+        "label_map": dataset.label_map,
+        "args": vars(args),
+    }, ckpt_path)
 
+    return {
+        "test_loss": te_final["loss"],
+        "train_loss": hist["train_loss"][-1],
+        "binary_acc": te_final.get("binary_acc"),
+        "multi_acc": te_final.get("multi_acc"),
+        "history": hist,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+#  Run one task (all folds)
+# ──────────────────────────────────────────────────────────────
+
+def run_task(task, dataset, args, device):
+    print(f"\n{'=' * 60}")
+    print(f"  Task: {task}")
+    print(f"{'=' * 60}")
+
+    fold_results = []
+    for fold in range(args.num_folds):
+        res = run_fold(fold, task, dataset, args, device)
+        fold_results.append(res)
+        ba = f"  Bin {res['binary_acc']:.4f}" if res["binary_acc"] is not None else ""
+        ma = f"  Mul {res['multi_acc']:.4f}" if res["multi_acc"] is not None else ""
+        print(f"     Fold {fold+1} done — TestLoss {res['test_loss']:.4f}{ba}{ma}")
+
+    return {"fold_results": fold_results}
+
+
+# ──────────────────────────────────────────────────────────────
+#  Summary table  (similar to paper Table 2)
+# ──────────────────────────────────────────────────────────────
+
+def _fmt(values):
+    """Format mean±std from a list of floats (or return '—' if empty)."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "—"
+    m, s = np.mean(vals), np.std(vals)
+    return f"{m:.4f}±{s:.4f}"
+
+
+def print_summary_table(all_results):
+    print(f"\n{'=' * 80}")
+    print("  Results Table  (mean ± std across 5 folds)")
+    print(f"{'=' * 80}")
+    header = (f"  {'Task':<14s}  {'Binary Acc':<14s}  {'Multiclass Acc':<14s}"
+              f"  {'Test Loss':<14s}  {'Train Loss':<14s}")
+    print(header)
+    print(f"  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*14}")
+
+    for task in ALL_TASKS:
+        if task not in all_results:
+            continue
+        folds = all_results[task]["fold_results"]
+        ba = _fmt([f["binary_acc"] for f in folds])
+        ma = _fmt([f["multi_acc"] for f in folds])
+        tl = _fmt([f["test_loss"] for f in folds])
+        trl = _fmt([f["train_loss"] for f in folds])
+        print(f"  {task:<14s}  {ba:<14s}  {ma:<14s}  {tl:<14s}  {trl:<14s}")
+
+    print(f"{'=' * 80}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Plotting
+# ──────────────────────────────────────────────────────────────
+
+def plot_training_curves(all_results, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    tasks = [t for t in ALL_TASKS if t in all_results]
+    n_tasks = len(tasks)
+
+    fig, axes = plt.subplots(n_tasks, 2, figsize=(14, 4.5 * n_tasks), squeeze=False)
+
+    for row, task in enumerate(tasks):
+        histories = [f["history"] for f in all_results[task]["fold_results"]]
+
+        # ---- Loss ----
+        ax = axes[row, 0]
+        train_loss = np.array([h["train_loss"] for h in histories])
+        epochs = np.arange(1, train_loss.shape[1] + 1)
+        mu, sigma = train_loss.mean(0), train_loss.std(0)
+        ax.plot(epochs, mu, label="Train", color="tab:blue")
+        ax.fill_between(epochs, mu - sigma, mu + sigma, alpha=0.15, color="tab:blue")
+
+        te_ep = np.array(histories[0]["test_epochs"]) + 1
+        te_loss = np.array([h["test_loss"] for h in histories])
+        mu, sigma = te_loss.mean(0), te_loss.std(0)
+        ax.plot(te_ep, mu, label="Test", color="tab:orange", marker=".", ms=4)
+        ax.fill_between(te_ep, mu - sigma, mu + sigma, alpha=0.15, color="tab:orange")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title(f"{task} — Loss")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # ---- Accuracy ----
+        ax = axes[row, 1]
+        colors = iter(["tab:green", "tab:red"])
+
+        if task in ("binary", "combined"):
+            accs = np.array([h["test_binary_acc"] for h in histories], dtype=np.float64)
+            mu, sigma = accs.mean(0), accs.std(0)
+            lbl = "Binary Acc" if task == "combined" else "Accuracy"
+            c = next(colors)
+            ax.plot(te_ep, mu, label=lbl, color=c, marker=".", ms=4)
+            ax.fill_between(te_ep, mu - sigma, mu + sigma, alpha=0.15, color=c)
+
+        if task in ("multiclass", "combined"):
+            accs = np.array([h["test_multi_acc"] for h in histories], dtype=np.float64)
+            mu, sigma = accs.mean(0), accs.std(0)
+            lbl = "Multiclass Acc" if task == "combined" else "Accuracy"
+            c = next(colors)
+            ax.plot(te_ep, mu, label=lbl, color=c, marker=".", ms=4)
+            ax.fill_between(te_ep, mu - sigma, mu + sigma, alpha=0.15, color=c)
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Accuracy")
+        ax.set_title(f"{task} — Accuracy")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"\n  Training curves saved → {path}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Dataset info printer
+# ──────────────────────────────────────────────────────────────
+
+def print_dataset_info(dataset: NGAFIDDataset):
+    header = dataset.flight_header
+
+    print(f"\n{'=' * 60}")
+    print("  Dataset Structure Overview")
+    print(f"{'=' * 60}")
+
+    print(f"\n  [flight_header.csv]  shape: {header.shape}")
+    print(f"    Columns: {list(header.columns)}")
+    print(f"\n    First 3 rows:")
+    print("    " + header.head(3).to_string(max_colwidth=30).replace("\n", "\n    "))
+
+    fold_counts = header["fold"].value_counts().sort_index()
+    print(f"\n  [Fold distribution]")
+    for fid, cnt in fold_counts.items():
+        print(f"    Fold {fid}: {cnt}")
+
+    ba_counts = header["before_after"].value_counts().sort_index()
+    print(f"\n  [before_after distribution]")
+    for val, cnt in ba_counts.items():
+        label = "after maintenance" if val == 0 else "before maintenance"
+        print(f"    {val} ({label}): {cnt}")
+
+    class_counts = header["target_class"].value_counts().sort_index()
+    print(f"\n  [target_class distribution]  ({dataset.num_classes} classes)")
+    for orig, cnt in class_counts.items():
+        print(f"    {orig:>3d} → idx {dataset._label2idx[orig]:<3d}  ({cnt} samples)")
+
+    first = dataset._data_dict[0]
+    raw = first["data"]
+    nonzero = int(np.any(raw != 0, axis=1).sum())
+    print(f"\n{'=' * 60}")
+    print("  First sample (raw)")
+    print(f"{'=' * 60}")
+    print(f"    before_after : {first['before_after']}")
+    print(f"    target_class : {first['target_class']}")
+    print(f"    fold         : {first['fold']}")
+    print(f"    data shape   : {raw.shape}  dtype={raw.dtype}")
+    print(f"    actual length: {nonzero} / {raw.shape[0]}")
+    print(f"    data[-1, :5] : {raw[-1, :5]}")
+
+    X, yb, ym = dataset.get_fold_data(first["fold"], training=False)
+    print(f"\n  First sample (normalised, from fold {first['fold']} test split)")
+    print(f"    X shape : {X.shape}   dtype={X.dtype}")
+    print(f"    y_binary[0]={yb[0]}   y_multi[0]={ym[0]}")
+    print(f"    X[0] range: [{X[0].min():.4f}, {X[0].max():.4f}]")
+    print()
+
+
+# ──────────────────────────────────────────────────────────────
+#  Main
+# ──────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="NGAFID CNN+Transformer 5-Fold CV")
+    parser = argparse.ArgumentParser(
+        description="NGAFID CNN+Transformer — 3-task 5-Fold CV benchmark"
+    )
 
     # data
     parser.add_argument("--data_name", type=str, default="2days")
@@ -280,11 +474,12 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tasks", nargs="+", default=ALL_TASKS,
+                        choices=ALL_TASKS, help="Which tasks to train")
 
     # misc
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--log_interval", type=int, default=10,
-                        help="Print test metrics every N epochs")
+    parser.add_argument("--log_interval", type=int, default=10)
 
     args = parser.parse_args()
 
@@ -294,46 +489,56 @@ def main():
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name()}")
 
-    print("Loading NGAFID dataset …")
+    print("\nLoading NGAFID dataset …")
     dataset = NGAFIDDataset(name=args.data_name, destination=args.data_dir)
     print(f"  Samples: {len(dataset.flight_header)}  |  Classes: {dataset.num_classes}")
-    print(f"  Label mapping: {dataset.label_map}")
-
     print_dataset_info(dataset)
 
-    fold_results: list[float] = []
+    all_results = {}
     t0 = time.time()
 
-    for fold in range(args.num_folds):
-        acc = run_fold(fold, dataset, args, device)
-        fold_results.append(acc)
+    for task in args.tasks:
+        task_result = run_task(task, dataset, args, device)
+        all_results[task] = task_result
 
     elapsed = time.time() - t0
 
-    print(f"\n{'=' * 60}")
-    print("  5-Fold Cross-Validation Results")
-    print(f"{'=' * 60}")
-    for i, acc in enumerate(fold_results):
-        print(f"  Fold {i + 1}: {acc:.4f}")
-    mean, std = np.mean(fold_results), np.std(fold_results)
-    print(f"  ────────────────────────────")
-    print(f"  Mean:  {mean:.4f} ± {std:.4f}")
+    # ── Summary table ──
+    print_summary_table(all_results)
     print(f"  Total time: {elapsed / 60:.1f} min")
 
-    summary_path = os.path.join(args.checkpoint_dir, "results.json")
-    with open(summary_path, "w") as f:
-        json.dump(
-            {
-                "fold_accuracies": fold_results,
-                "mean_accuracy": float(mean),
-                "std_accuracy": float(std),
-                "elapsed_seconds": elapsed,
-                "args": vars(args),
-            },
-            f,
-            indent=2,
-        )
-    print(f"  Results saved → {summary_path}")
+    # ── Plot curves ──
+    plot_dir = os.path.join(args.checkpoint_dir, "plots")
+    plot_training_curves(all_results, plot_dir)
+
+    # ── Save JSON ──
+    summary = {"elapsed_seconds": elapsed, "args": vars(args), "tasks": {}}
+    for task, tres in all_results.items():
+        folds = tres["fold_results"]
+        entry = {}
+        ba = [f["binary_acc"] for f in folds if f.get("binary_acc") is not None]
+        ma = [f["multi_acc"] for f in folds if f.get("multi_acc") is not None]
+        tl = [f["test_loss"] for f in folds]
+        trl = [f["train_loss"] for f in folds]
+        if ba:
+            entry["binary_acc_mean"] = float(np.mean(ba))
+            entry["binary_acc_std"] = float(np.std(ba))
+            entry["binary_acc_per_fold"] = ba
+        if ma:
+            entry["multi_acc_mean"] = float(np.mean(ma))
+            entry["multi_acc_std"] = float(np.std(ma))
+            entry["multi_acc_per_fold"] = ma
+        entry["test_loss_mean"] = float(np.mean(tl))
+        entry["test_loss_std"] = float(np.std(tl))
+        entry["train_loss_mean"] = float(np.mean(trl))
+        entry["train_loss_std"] = float(np.std(trl))
+        summary["tasks"][task] = entry
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    results_path = os.path.join(args.checkpoint_dir, "results.json")
+    with open(results_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Results saved → {results_path}")
 
 
 if __name__ == "__main__":

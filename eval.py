@@ -1,13 +1,13 @@
 """
-Standalone evaluation script.
+Standalone evaluation script for the CNN + Transformer multi-task models.
 
-Loads saved checkpoints and evaluates on the corresponding test fold,
+Loads saved checkpoints and evaluates on the corresponding test fold(s),
 printing per-fold accuracy and an overall classification report.
 
 Usage:
-    python eval.py                                  # evaluate all 5 folds
-    python eval.py --folds 0 2                      # evaluate folds 0 and 2 only
-    python eval.py --checkpoint_dir checkpoints     # custom checkpoint directory
+    python eval.py                                  # evaluate all tasks, all folds
+    python eval.py --tasks binary multiclass
+    python eval.py --folds 0 2
 """
 
 import argparse
@@ -21,53 +21,70 @@ from torch.utils.data import DataLoader, TensorDataset
 from data_loader import NGAFIDDataset
 from model import CNNTransformerClassifier
 
+ALL_TASKS = ["binary", "multiclass", "combined"]
+
 
 @torch.no_grad()
-def evaluate_fold(
-    fold: int,
-    dataset: NGAFIDDataset,
-    checkpoint_dir: str,
-    batch_size: int,
-    device: torch.device,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    ckpt_path = os.path.join(checkpoint_dir, f"fold_{fold}.pt")
+def evaluate_fold(fold, task, dataset, checkpoint_dir, batch_size, device):
+    ckpt_path = os.path.join(checkpoint_dir, task, f"fold_{fold}.pt")
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    saved_args = ckpt["args"]
+    sa = ckpt["args"]
 
     model = CNNTransformerClassifier(
-        in_channels=23,
-        num_classes=ckpt["num_classes"],
-        d_model=saved_args["d_model"],
-        nhead=saved_args["nhead"],
-        num_encoder_layers=saved_args["num_encoder_layers"],
-        dim_feedforward=saved_args["dim_feedforward"],
-        dropout=saved_args["dropout"],
+        in_channels=23, num_classes=ckpt["num_classes"],
+        d_model=sa["d_model"], nhead=sa["nhead"],
+        num_encoder_layers=sa["num_encoder_layers"],
+        dim_feedforward=sa["dim_feedforward"],
+        dropout=sa["dropout"], task=task,
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    test_X, test_y = dataset.get_fold_data(fold, training=False)
-    test_ds = TensorDataset(
-        torch.from_numpy(test_X), torch.from_numpy(test_y)
+    test_X, test_yb, test_ym = dataset.get_fold_data(fold, training=False)
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(test_X),
+                       torch.from_numpy(test_yb),
+                       torch.from_numpy(test_ym)),
+        batch_size=batch_size, shuffle=False, num_workers=0,
     )
-    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    all_preds, all_labels = [], []
-    correct, total = 0, 0
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
-        logits = model(X)
-        preds = logits.argmax(1)
-        correct += (preds == y).sum().item()
-        total += y.size(0)
-        all_preds.append(preds.cpu().numpy())
-        all_labels.append(y.cpu().numpy())
+    bin_preds, bin_labels = [], []
+    multi_preds, multi_labels = [], []
 
-    acc = correct / total
-    return acc, np.concatenate(all_preds), np.concatenate(all_labels)
+    for X, yb, ym in loader:
+        X = X.to(device)
+
+        if task == "binary":
+            logits = model(X)
+            bin_preds.append(logits.argmax(1).cpu().numpy())
+            bin_labels.append(yb.numpy())
+        elif task == "multiclass":
+            logits = model(X)
+            multi_preds.append(logits.argmax(1).cpu().numpy())
+            multi_labels.append(ym.numpy())
+        else:
+            bl, ml = model(X)
+            bin_preds.append(bl.argmax(1).cpu().numpy())
+            bin_labels.append(yb.numpy())
+            multi_preds.append(ml.argmax(1).cpu().numpy())
+            multi_labels.append(ym.numpy())
+
+    result = {}
+    if bin_preds:
+        bp, bl = np.concatenate(bin_preds), np.concatenate(bin_labels)
+        result["binary_acc"] = float((bp == bl).mean())
+        result["binary_preds"] = bp
+        result["binary_labels"] = bl
+    if multi_preds:
+        mp, ml = np.concatenate(multi_preds), np.concatenate(multi_labels)
+        result["multi_acc"] = float((mp == ml).mean())
+        result["multi_preds"] = mp
+        result["multi_labels"] = ml
+
+    return result
 
 
 def main():
@@ -76,10 +93,8 @@ def main():
     parser.add_argument("--data_dir", type=str, default=".")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument(
-        "--folds", type=int, nargs="+", default=None,
-        help="Fold indices to evaluate (default: all available)",
-    )
+    parser.add_argument("--tasks", nargs="+", default=ALL_TASKS, choices=ALL_TASKS)
+    parser.add_argument("--folds", type=int, nargs="+", default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,39 +103,56 @@ def main():
     print("Loading NGAFID dataset …")
     dataset = NGAFIDDataset(name=args.data_name, destination=args.data_dir)
     label_map = dataset.label_map
-    class_names = [str(label_map[i]) for i in range(dataset.num_classes)]
-
     folds = args.folds if args.folds is not None else list(range(5))
-    fold_accs: list[float] = []
-    all_preds_global, all_labels_global = [], []
 
-    for fold in folds:
-        print(f"\n--- Fold {fold + 1} ---")
-        acc, preds, labels = evaluate_fold(
-            fold, dataset, args.checkpoint_dir, args.batch_size, device
-        )
-        fold_accs.append(acc)
-        all_preds_global.append(preds)
-        all_labels_global.append(labels)
-        print(f"  Accuracy: {acc:.4f}  ({int(acc * len(labels))}/{len(labels)})")
+    for task in args.tasks:
+        print(f"\n{'=' * 60}")
+        print(f"  Task: {task}")
+        print(f"{'=' * 60}")
 
-    print(f"\n{'=' * 60}")
-    print("  Summary")
-    print(f"{'=' * 60}")
-    for i, (f, acc) in enumerate(zip(folds, fold_accs)):
-        print(f"  Fold {f + 1}: {acc:.4f}")
-    mean, std = np.mean(fold_accs), np.std(fold_accs)
-    print(f"  ────────────────────────────")
-    print(f"  Mean:  {mean:.4f} ± {std:.4f}")
+        all_bin_p, all_bin_l = [], []
+        all_mul_p, all_mul_l = [], []
+        fold_accs_bin, fold_accs_mul = [], []
 
-    all_preds_np = np.concatenate(all_preds_global)
-    all_labels_np = np.concatenate(all_labels_global)
-    print(f"\n  Classification Report (aggregated over evaluated folds):\n")
-    print(
-        classification_report(
-            all_labels_np, all_preds_np, target_names=class_names, digits=4
-        )
-    )
+        for fold in folds:
+            try:
+                res = evaluate_fold(fold, task, dataset, args.checkpoint_dir,
+                                    args.batch_size, device)
+            except FileNotFoundError as e:
+                print(f"  {e} — skipping")
+                continue
+
+            parts = [f"Fold {fold+1}:"]
+            if "binary_acc" in res:
+                parts.append(f"Binary {res['binary_acc']:.4f}")
+                fold_accs_bin.append(res["binary_acc"])
+                all_bin_p.append(res["binary_preds"])
+                all_bin_l.append(res["binary_labels"])
+            if "multi_acc" in res:
+                parts.append(f"Multiclass {res['multi_acc']:.4f}")
+                fold_accs_mul.append(res["multi_acc"])
+                all_mul_p.append(res["multi_preds"])
+                all_mul_l.append(res["multi_labels"])
+            print("  " + "  ".join(parts))
+
+        if fold_accs_bin:
+            m, s = np.mean(fold_accs_bin), np.std(fold_accs_bin)
+            print(f"\n  Binary Acc mean: {m:.4f} ± {s:.4f}")
+        if fold_accs_mul:
+            m, s = np.mean(fold_accs_mul), np.std(fold_accs_mul)
+            print(f"  Multiclass Acc mean: {m:.4f} ± {s:.4f}")
+
+        if all_bin_p:
+            bp, bl = np.concatenate(all_bin_p), np.concatenate(all_bin_l)
+            print(f"\n  Binary classification report (aggregated):\n")
+            print(classification_report(bl, bp,
+                  target_names=["after (0)", "before (1)"], digits=4))
+
+        if all_mul_p:
+            mp, ml = np.concatenate(all_mul_p), np.concatenate(all_mul_l)
+            names = [str(label_map[i]) for i in range(dataset.num_classes)]
+            print(f"\n  Multiclass classification report (aggregated):\n")
+            print(classification_report(ml, mp, target_names=names, digits=4))
 
 
 if __name__ == "__main__":

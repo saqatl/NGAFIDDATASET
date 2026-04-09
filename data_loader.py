@@ -7,7 +7,6 @@ requiring TensorFlow, so the environment only needs PyTorch.
 
 import os
 import tarfile
-
 import urllib.request
 
 import numpy as np
@@ -77,7 +76,7 @@ class NGAFIDDataset:
 
     @property
     def label_map(self) -> dict:
-        """Maps contiguous index → original target_class value."""
+        """Maps contiguous index -> original target_class value."""
         return dict(self._idx2label)
 
     def _build_data_dict(self) -> list[dict]:
@@ -94,6 +93,7 @@ class NGAFIDDataset:
                 {
                     "data": arr,
                     "target_class": row["target_class"],
+                    "before_after": row["before_after"],
                     "fold": row["fold"],
                 }
             )
@@ -101,15 +101,16 @@ class NGAFIDDataset:
 
     def get_fold_data(
         self, fold: int, training: bool = True
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Return (X, y) for the given fold.
+        Return (X, y_binary, y_multiclass) for the given fold.
 
-        training=True  → all folds except `fold` (4/5 of data)
-        training=False → only `fold` (1/5 of data)
+        training=True  -> all folds except `fold`  (4/5 of data)
+        training=False -> only `fold`               (1/5 of data)
 
-        X is float32, min-max normalised, NaN replaced with 0.
-        y is int64, labels remapped to contiguous [0, num_classes).
+        X            : float32, min-max normalised, NaN replaced with 0.
+        y_binary     : int64, 0 = after maintenance, 1 = before maintenance.
+        y_multiclass : int64, remapped to contiguous [0, num_classes).
         """
         if training:
             subset = [d for d in self._data_dict if d["fold"] != fold]
@@ -118,11 +119,14 @@ class NGAFIDDataset:
 
         X = np.array([d["data"] for d in subset], dtype=np.float32)
         denom = self.maxs - self.mins
-        denom[denom == 0] = 1.0  # avoid division by zero for constant channels
+        denom[denom == 0] = 1.0
         X = (X - self.mins) / denom
         np.nan_to_num(X, copy=False)
 
-        y = np.array(
+        y_binary = np.array(
+            [d["before_after"] for d in subset], dtype=np.int64
+        )
+        y_multi = np.array(
             [self._label2idx[d["target_class"]] for d in subset], dtype=np.int64
         )
-        return X, y
+        return X, y_binary, y_multi

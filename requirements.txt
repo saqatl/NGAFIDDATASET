@@ -6,3 +6,4 @@ lz4
 tqdm
 scikit-learn
 loguru
+matplotlib
