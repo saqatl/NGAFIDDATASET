@@ -1,3 +1,17 @@
+**本项目 fork 自 [hyang0129/NGAFIDDATASET](https://github.com/hyang0129/NGAFIDDATASET/tree/main)**
+
+要运行本项目，建议先从  https://doi.org/10.5281/zenodo.6624956 或 https://www.kaggle.com/datasets/hooong/aviation-maintenance-dataset-from-the-ngafid 中下载 2days.tar.gz 数据集，然后运行
+
+```
+pip install -r requirements.txt
+```
+
+配置环境。（其实也内置了数据集下载，但是 ssh 连接之后下载速度实在太慢了！没有完整测试这项功能。）
+
+下面是原始仓库的 readme。
+
+
+
 # NGAFIDDATASET
 
 This github repository contains code related to the paper A Large-Scale Annotated Multivariate Time Series Aviation Maintenance Dataset from the NGAFID. 
