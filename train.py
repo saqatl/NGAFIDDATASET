@@ -8,6 +8,7 @@ Tasks (following the original paper):
 
 Optional optimisations (all OFF by default for baseline reproducibility):
   --weighted_loss   sqrt-inverse-frequency class weights + label smoothing
+  --focal_loss      Focal Loss instead of CE (better for class imbalance)
   --deep_head       deeper classification head (hidden layer + dropout)
 
 Data augmentation (individually selectable, or --augment to enable all):
@@ -63,16 +64,47 @@ def set_seed(seed: int = 42):
 
 
 def compute_class_weights(
-    y: np.ndarray, num_classes: int, device: torch.device
+    y: np.ndarray, num_classes: int, device: torch.device,
+    max_ratio: float = 5.0,
 ) -> torch.Tensor:
-    """Sqrt-inverse-frequency weights — much gentler than raw inverse frequency."""
+    """Sqrt-inverse-frequency weights, clamped so no class exceeds
+    clamp: max_ratio times the median weight (prevents gradient explosion
+    on extremely rare classes)"""
     counts = Counter(y.tolist())
     weights = torch.tensor(
         [1.0 / math.sqrt(max(counts.get(i, 1), 1)) for i in range(num_classes)],
         dtype=torch.float32,
         device=device,
     )
+    weights = weights.clamp(max=weights.median() * max_ratio)
     return weights / weights.sum() * num_classes
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al., 2017) for class-imbalanced classification.
+
+    Down-weights well-classified examples so the model focuses on hard /
+    misclassified samples — especially helpful for rare classes.
+    """
+
+    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0,
+                 label_smoothing: float = 0.0, reduction: str = "mean"):
+        super().__init__()
+        self.register_buffer("alpha", alpha)
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(
+            logits, targets,
+            weight=self.alpha,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        pt = torch.exp(-ce)
+        loss = (1.0 - pt) ** self.gamma * ce
+        return loss.mean() if self.reduction == "mean" else loss.sum()
 
 
 def aug_noise(X: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
@@ -258,22 +290,35 @@ def evaluate(model, loader, task, criterions, device):
 # ──────────────────────────────────────────────────────────────
 
 def build_criterions(task, train_yb, train_ym, num_classes, device,
-                     weighted_loss: bool):
+                     weighted_loss: bool, focal_loss: bool = False,
+                     focal_gamma: float = 2.0):
     criterions = {}
 
     if task in ("binary", "combined"):
-        kwargs = {}
-        if weighted_loss:
-            kwargs["weight"] = compute_class_weights(train_yb, 2, device)
-            kwargs["label_smoothing"] = 0.1
-        criterions["binary"] = nn.CrossEntropyLoss(**kwargs)
+        weight = compute_class_weights(train_yb, 2, device) if weighted_loss else None
+        ls = 0.1 if weighted_loss else 0.0
+        if focal_loss:
+            criterions["binary"] = FocalLoss(alpha=weight, gamma=focal_gamma,
+                                             label_smoothing=ls)
+        else:
+            kwargs = {}
+            if weighted_loss:
+                kwargs["weight"] = weight
+                kwargs["label_smoothing"] = ls
+            criterions["binary"] = nn.CrossEntropyLoss(**kwargs)
 
     if task in ("multiclass", "combined"):
-        kwargs = {}
-        if weighted_loss:
-            kwargs["weight"] = compute_class_weights(train_ym, num_classes, device)
-            kwargs["label_smoothing"] = 0.05
-        criterions["multi"] = nn.CrossEntropyLoss(**kwargs)
+        weight = compute_class_weights(train_ym, num_classes, device) if weighted_loss else None
+        ls = 0.05 if weighted_loss else 0.0
+        if focal_loss:
+            criterions["multi"] = FocalLoss(alpha=weight, gamma=focal_gamma,
+                                            label_smoothing=ls)
+        else:
+            kwargs = {}
+            if weighted_loss:
+                kwargs["weight"] = weight
+                kwargs["label_smoothing"] = ls
+            criterions["multi"] = nn.CrossEntropyLoss(**kwargs)
 
     return criterions
 
@@ -316,6 +361,8 @@ def run_fold(fold, task, dataset, args, device):
     criterions = build_criterions(
         task, train_yb, train_ym, dataset.num_classes, device,
         weighted_loss=args.weighted_loss,
+        focal_loss=args.focal_loss,
+        focal_gamma=args.focal_gamma,
     )
 
     optimizer = torch.optim.AdamW(
@@ -622,6 +669,10 @@ def main():
     # optimisations (all OFF by default)
     parser.add_argument("--weighted_loss", action="store_true",
                         help="Enable sqrt-inverse-frequency class weights + label smoothing")
+    parser.add_argument("--focal_loss", action="store_true",
+                        help="Use Focal Loss instead of CrossEntropyLoss (better for imbalanced classes)")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal Loss gamma (focusing parameter); higher = more focus on hard samples")
     parser.add_argument("--deep_head", action="store_true",
                         help="Enable deeper classification head (Linear-GELU-Dropout-Linear)")
 
@@ -659,6 +710,7 @@ def main():
     any_aug = args.aug_noise or args.aug_scale or args.aug_wslice or args.aug_timewarp
     print(f"\nOptimisations:")
     print(f"  --weighted_loss : {'ON' if args.weighted_loss else 'OFF'}")
+    print(f"  --focal_loss    : {'ON (gamma=' + str(args.focal_gamma) + ')' if args.focal_loss else 'OFF'}")
     print(f"  --deep_head     : {'ON' if args.deep_head else 'OFF'}")
     print(f"  Augmentation    : {'OFF' if not any_aug else ''}")
     if any_aug:
