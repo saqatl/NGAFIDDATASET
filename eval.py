@@ -39,6 +39,7 @@ def evaluate_fold(fold, task, dataset, checkpoint_dir, batch_size, device):
         num_encoder_layers=sa["num_encoder_layers"],
         dim_feedforward=sa["dim_feedforward"],
         dropout=sa["dropout"], task=task,
+        deep_head=sa.get("deep_head", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
