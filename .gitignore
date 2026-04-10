@@ -4,3 +4,4 @@ checkpoints/
 *.tar.gz
 checkpoints_wslice_timewarp/
 checkpoints_original/
+checkpoints_focal/
