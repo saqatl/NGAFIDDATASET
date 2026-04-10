@@ -82,19 +82,26 @@ def compute_class_weights(
 
 
 def build_sampler(task: str, train_yb: np.ndarray,
-                  train_ym: np.ndarray) -> WeightedRandomSampler:
-    """Oversample rare classes.
+                  train_ym: np.ndarray,
+                  max_ratio: float = 5.0) -> WeightedRandomSampler:
+    """Build a WeightedRandomSampler that gently oversamples rare classes.
 
-    For binary/multiclass tasks the label used is obvious; for the combined
-    task we use the multiclass label because it has the most severe imbalance.
+    Uses sqrt-inverse-frequency + clamp (same philosophy as
+    compute_class_weights) so that rare classes are boosted without
+    starving the majority class of training signal.
+
+    For the combined task we use the multiclass label because it has
+    the most severe imbalance.
     """
-    if task == "binary":
-        labels = train_yb
-    else:
-        labels = train_ym
+    labels = train_yb if task == "binary" else train_ym
 
     counts = Counter(labels.tolist())
-    sample_weights = np.array([1.0 / counts[int(l)] for l in labels],
+    cls_weights = {c: 1.0 / math.sqrt(n) for c, n in counts.items()}
+    median_w = float(np.median(list(cls_weights.values())))
+    cap = median_w * max_ratio
+    cls_weights = {c: min(w, cap) for c, w in cls_weights.items()}
+
+    sample_weights = np.array([cls_weights[int(l)] for l in labels],
                               dtype=np.float64)
     return WeightedRandomSampler(
         weights=sample_weights,
