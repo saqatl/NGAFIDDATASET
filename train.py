@@ -9,6 +9,7 @@ Tasks (following the original paper):
 Optional optimisations (all OFF by default for baseline reproducibility):
   --weighted_loss   sqrt-inverse-frequency class weights + label smoothing
   --focal_loss      Focal Loss instead of CE (better for class imbalance)
+  --oversample      WeightedRandomSampler to oversample rare classes
   --deep_head       deeper classification head (hidden layer + dropout)
 
 Data augmentation (individually selectable, or --augment to enable all):
@@ -42,7 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, recall_score
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from data_loader import NGAFIDDataset
 from model import CNNTransformerClassifier
@@ -78,6 +79,28 @@ def compute_class_weights(
     )
     weights = weights.clamp(max=weights.median() * max_ratio)
     return weights / weights.sum() * num_classes
+
+
+def build_sampler(task: str, train_yb: np.ndarray,
+                  train_ym: np.ndarray) -> WeightedRandomSampler:
+    """Oversample rare classes.
+
+    For binary/multiclass tasks the label used is obvious; for the combined
+    task we use the multiclass label because it has the most severe imbalance.
+    """
+    if task == "binary":
+        labels = train_yb
+    else:
+        labels = train_ym
+
+    counts = Counter(labels.tolist())
+    sample_weights = np.array([1.0 / counts[int(l)] for l in labels],
+                              dtype=np.float64)
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
 
 
 class FocalLoss(nn.Module):
@@ -334,13 +357,20 @@ def run_fold(fold, task, dataset, args, device):
     test_X, test_yb, test_ym = dataset.get_fold_data(fold, training=False)
     print(f"     Train {len(train_yb)}  |  Test {len(test_yb)}")
 
-    train_loader = DataLoader(
-        TensorDataset(torch.from_numpy(train_X),
-                       torch.from_numpy(train_yb),
-                       torch.from_numpy(train_ym)),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=device.type == "cuda",
-    )
+    train_ds = TensorDataset(torch.from_numpy(train_X),
+                              torch.from_numpy(train_yb),
+                              torch.from_numpy(train_ym))
+    if args.oversample:
+        sampler = build_sampler(task, train_yb, train_ym)
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=sampler,
+            num_workers=0, pin_memory=device.type == "cuda",
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=device.type == "cuda",
+        )
     test_loader = DataLoader(
         TensorDataset(torch.from_numpy(test_X),
                        torch.from_numpy(test_yb),
@@ -673,6 +703,8 @@ def main():
                         help="Use Focal Loss instead of CrossEntropyLoss (better for imbalanced classes)")
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                         help="Focal Loss gamma (focusing parameter); higher = more focus on hard samples")
+    parser.add_argument("--oversample", action="store_true",
+                        help="Oversample rare classes via WeightedRandomSampler")
     parser.add_argument("--deep_head", action="store_true",
                         help="Enable deeper classification head (Linear-GELU-Dropout-Linear)")
 
@@ -711,6 +743,7 @@ def main():
     print(f"\nOptimisations:")
     print(f"  --weighted_loss : {'ON' if args.weighted_loss else 'OFF'}")
     print(f"  --focal_loss    : {'ON (gamma=' + str(args.focal_gamma) + ')' if args.focal_loss else 'OFF'}")
+    print(f"  --oversample    : {'ON' if args.oversample else 'OFF'}")
     print(f"  --deep_head     : {'ON' if args.deep_head else 'OFF'}")
     print(f"  Augmentation    : {'OFF' if not any_aug else ''}")
     if any_aug:
